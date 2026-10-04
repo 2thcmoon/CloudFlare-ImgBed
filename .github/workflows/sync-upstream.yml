@@ -10,6 +10,11 @@ on:
     - cron: "0 0 * * *" # every day
   workflow_dispatch:
     inputs:
+      verify_only:
+        description: "Validate authentication and merge locally without pushing or deploying / 仅验证，不推送、不部署"
+        required: true
+        default: true
+        type: boolean
       confirm_breaking_update:
         description: "I have reviewed any compatibility update notice and agree to apply it if present / 我已阅读可能存在的兼容性更新公告，并同意在有此类更新时应用"
         required: true
@@ -27,13 +32,37 @@ jobs:
     if: ${{ github.event.repository.fork }}
 
     steps:
+      - name: Check sync credential configuration
+        env:
+          TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+        run: |
+          if [[ "$TOKEN_CONFIGURED" != "true" ]]; then
+            echo "::error::Configure UPSTREAM_SYNC_TOKEN with Contents and Workflows write access to this repository."
+            exit 1
+          fi
+
       - name: Checkout target repo
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_only && github.ref_name || 'main' }}
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          persist-credentials: false
+
+      - name: Validate upstream merge without pushing
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_only
+        run: |
+          set -euo pipefail
+          git config user.name "Upstream Sync Validation"
+          git config user.email "action@github.com"
+          git remote add validation-upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git
+          git fetch --no-tags validation-upstream main
+          trap 'git merge --abort >/dev/null 2>&1 || true' EXIT
+          git merge --no-commit --no-ff validation-upstream/main
+          echo "Local merge passed. No push or deployment was performed. Server-side workflow write permission still requires a real push." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check breaking update policy
+        if: github.event_name != 'workflow_dispatch' || !inputs.verify_only
         id: breaking_guard
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -44,13 +73,13 @@ jobs:
 
       - name: Sync upstream changes
         id: sync
-        if: steps.breaking_guard.outputs.blocked != 'true'
+        if: (github.event_name != 'workflow_dispatch' || !inputs.verify_only) && steps.breaking_guard.outputs.blocked != 'true'
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
           upstream_sync_branch: main
           target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          target_repo_token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           test_mode: false
 
       - name: Complete breaking update notices
@@ -59,26 +88,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
 
-      - name: Trigger Worker deploy
-        if: steps.sync.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
+      # A push using UPSTREAM_SYNC_TOKEN triggers deploy-worker.yml through its main push event.
+      # Do not dispatch it again: that would deploy twice.
 
       - name: Sync failure guidance
         if: failure() && steps.sync.outcome == 'failure'
         run: |
           {
-            echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
+            echo "## Upstream synchronization failed / 上游同步失败"
             echo
-            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
+            echo "If GitHub rejects workflow changes, check UPSTREAM_SYNC_TOKEN: resource owner 2thcmoon, only CloudFlare-ImgBed, Contents and Workflows write access, and a valid expiry."
+            echo "若 GitHub 拒绝工作流变更，请检查 UPSTREAM_SYNC_TOKEN 的仓库范围、Contents/Workflows 写权限及有效期。GITHUB_TOKEN 的普通读写设置不能替代该权限。"
             echo
-            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
-            echo
-            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
-            echo
-            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
+            echo "For merge conflicts or other failures, inspect the Sync upstream changes log before retrying. Use verify_only for a local merge check without pushing or deploying."
+            echo "其他失败请查看同步步骤日志；先使用 verify_only 验证，避免直接触发部署。"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
-          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
           exit 1
